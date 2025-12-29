@@ -3,106 +3,103 @@ import pandas as pd
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 
+def get_last_trading_day(date_obj):
+    """
+    根據目前時間計算最近一個有資料的交易日
+    """
+    # 台灣時區現在時間
+    now = date_obj + timedelta(hours=8)
+    
+    # 如果現在是 18:30 以前，我們先看昨天
+    if now.hour < 18 or (now.hour == 18 and now.minute < 30):
+        check_date = now - timedelta(days=1)
+    else:
+        check_date = now
+
+    # 如果 check_date 是週日(6)，退到週五
+    if check_date.weekday() == 6:
+        check_date -= timedelta(days=2)
+    # 如果 check_date 是週六(5)，退到週五
+    elif check_date.weekday() == 5:
+        check_date -= timedelta(days=1)
+        
+    return check_date.strftime("%Y-%m-%d")
+
 def run_analysis():
-    # 1. 讀取 Token 並登入
+    # 1. 初始化與登入
     token = os.getenv('FINMIND_TOKEN')
     dl = DataLoader()
     if token:
         try:
             dl.login(api_token=token)
-        except Exception as e:
-            print(f"登入失敗: {e}")
+        except:
+            print("Token 登入失敗")
 
-    # 2. 決定分析日期 (考慮台灣時區 UTC+8)
-    # 如果現在不到晚上 18:30，我們就抓「前一個交易日」
-    now_tw = datetime.utcnow() + timedelta(hours=8)
-    if now_tw.hour < 18 or (now_tw.hour == 18 and now_tw.minute < 30):
-        target_date = (now_tw - timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        target_date = now_tw.strftime("%Y-%m-%d")
-    
-    print(f"📡 正在分析日期: {target_date}")
+    # 2. 取得日期 (自動避開週末)
+    target_date = get_last_trading_day(datetime.utcnow())
+    print(f"📡 最終決定分析日期: {target_date}")
 
-    # 定義城中幫與常見隔日沖分點
     target_brokers = ['凱基-城中', '統一-城中', '元大-城中', '凱基-台北', '凱基-松山', '富邦-建國', '美林', '摩根大通']
 
     try:
-        # 【修正重點】使用正確的報表指令獲取全市場行情
+        # 3. 抓取行情 (全市場報表)
         df_price = dl.taiwan_stock_trading_daily_report(date=target_date)
         
         if df_price is None or df_price.empty:
-            return f"<div class='alert alert-info'><h3>{target_date} 目前尚無盤後報表數據</h3><p>請等待台灣時間 18:30 資料更新後再試。</p></div>"
+            return f"<h1>{target_date} 為休市日或無資料</h1>"
 
-        # 3. 篩選漲停股 
-        # 由於報表中通常有 'spread' (漲跌) 欄位，我們計算漲幅
-        # 漲停通常為前日收盤 * 1.1，這裡簡單判斷漲幅 > 9.7%
-        # 部分報表欄位為 'change' 或 'spread'，視 FinMind 傳回而定
-        df_price['change_rate'] = df_price['spread'] / (df_price['close'] - df_price['spread'])
-        limit_up = df_price[df_price['change_rate'] >= 0.097]
+        # 4. 篩選漲停 (漲幅大於 9.7%)
+        # 判斷欄位名稱 (FinMind 版本不同欄位可能略有差異)
+        if 'spread' in df_price.columns and 'close' in df_price.columns:
+            df_price['change_rate'] = df_price['spread'] / (df_price['close'] - df_price['spread'])
+            limit_up = df_price[df_price['change_rate'] >= 0.097]
+        else:
+            # 備用判斷 (如果沒有 spread)
+            limit_up = df_price[df_price['change'] >= 9.5] if 'change' in df_price.columns else df_price.head(0)
+
         stock_list = limit_up['stock_id'].tolist()
-        
-        print(f"📊 找到 {len(stock_list)} 檔漲停/強勢股")
+        print(f"📊 找到 {len(stock_list)} 檔強勢股")
 
         results = []
-        for stock_id in stock_list:
-            # 4. 抓取分點資料 (此部分指令目前維持穩定)
-            df_chips = dl.taiwan_stock_broker_analysis(
-                stock_id=stock_id, 
-                start_date=target_date, 
-                end_date=target_date
-            )
-            
-            if df_chips is not None and not df_chips.empty:
-                hits = df_chips[df_chips['broker_name'].isin(target_brokers)].copy()
-                if not hits.empty:
-                    hits['net_buy'] = hits['buy'] - hits['sell']
-                    # 只取淨買超 > 50 張的大戶
-                    heavy_hits = hits[hits['net_buy'] > 50]
-                    for _, row in heavy_hits.iterrows():
-                        results.append({
-                            "股票": stock_id,
-                            "分點名稱": row['broker_name'],
-                            "買超張數": int(row['net_buy'])
-                        })
+        # 為了避免 API 請求太頻繁，我們只分析前 30 檔最強的
+        for stock_id in stock_list[:30]:
+            try:
+                df_chips = dl.taiwan_stock_broker_analysis(stock_id=stock_id, start_date=target_date, end_date=target_date)
+                if df_chips is not None and not df_chips.empty:
+                    hits = df_chips[df_chips['broker_name'].isin(target_brokers)].copy()
+                    if not hits.empty:
+                        hits['net_buy'] = hits['buy'] - hits['sell']
+                        heavy_hits = hits[hits['net_buy'] > 50]
+                        for _, row in heavy_hits.iterrows():
+                            results.append({"股票": stock_id, "分點": row['broker_name'], "買超": int(row['net_buy'])})
+            except:
+                continue
 
-        # 5. 生成網頁內容
+        # 5. 輸出 HTML
         if results:
-            df_final = pd.DataFrame(results)
-            html_table = df_final.to_html(classes='table table-striped table-dark', index=False)
+            html_table = pd.DataFrame(results).to_html(classes='table table-dark table-striped', index=False)
         else:
-            html_table = "<div class='alert alert-warning'>今日漲停股中，無指定大戶（如城中幫）大量買超跡象。</div>"
+            html_table = f"<div class='alert alert-secondary'>今日 ({target_date}) 漲停股中無指定大戶跡象。</div>"
 
         return f"""
         <html>
         <head>
             <meta charset="utf-8">
             <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-            <style>
-                body {{ background-color: #121212; color: #ffffff; padding: 50px; font-family: "Microsoft JhengHei", sans-serif; }}
-                .table {{ color: white; }}
-                .container {{ max-width: 800px; }}
-            </style>
+            <style>body{{background:#121212;color:white;padding:30px;}} .table{{color:white;}}</style>
         </head>
         <body>
-            <div class="container">
-                <h1 class="mb-4">🔍 {target_date} 城中幫 & 隔日沖監控</h1>
-                {html_table}
-                <hr>
-                <p class="text-secondary small">自動分析時間: {now_tw.strftime('%Y-%m-%d %H:%M:%S')} (台北時間)</p>
-                <p class="text-secondary small">監控清單：{', '.join(target_brokers)}</p>
-            </div>
+            <h1>🚀 隔日沖大戶監控報表</h1>
+            <p>分析日期：{target_date}</p>
+            {html_table}
+            <p style='color:gray; font-size:12px; margin-top:20px;'>更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </body>
         </html>
         """
     except Exception as e:
-        print(f"錯誤細節: {e}")
-        return f"<h1>系統分析時發生異常</h1><p>請檢查 Actions 日誌或 Token 權限。</p><p>錯誤訊息: {str(e)}</p>"
+        return f"<h1>分析發生錯誤</h1><p>可能原因：日期為假日或 API 次數達上限</p><p>錯誤代碼：{str(e)}</p>"
 
 if __name__ == "__main__":
     content = run_analysis()
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(content)
-        f.write(content)
-    html_result = run_analysis()
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(html_result)
