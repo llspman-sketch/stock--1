@@ -1,0 +1,36 @@
+name: Daily Stock Analysis
+
+on:
+  schedule:
+    - cron: '30 10 * * 1-5' # 台灣時間週一至週五 18:30 執行
+  workflow_dispatch: # 允許手動執行
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run analysis
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python main.py
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add index.html
+          git commit -m "Update daily report" || exit 0
+          git push
